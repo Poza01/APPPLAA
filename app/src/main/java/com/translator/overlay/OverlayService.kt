@@ -23,14 +23,12 @@ class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var floatingButton: TextView
-    private var subMenuView: LinearLayout? = null
     private var resultOverlay: View? = null
 
     private var mediaProjection: MediaProjection? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
 
-    private var isDoubleClickEnabled = true
     private var lastClickTime = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -80,8 +78,27 @@ class OverlayService : Service() {
     }
 
     private fun setupFloatingButton() {
+        val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
+
+        // ขนาดปุ่ม
+        val btnSizeIndex = prefs.getInt("btn_size_index", 1)
+        val btnPxSize = when (btnSizeIndex) {
+            0 -> 120 // Small
+            2 -> 180 // Large
+            else -> 150 // Medium
+        }
+
+        // ความโปร่งแสง
+        val btnOpacityIndex = prefs.getInt("btn_opacity_index", 1)
+        val alphaValue = when (btnOpacityIndex) {
+            0 -> 255 // 100%
+            2 -> 128 // 50%
+            3 -> 76  // 30%
+            else -> 204 // 80%
+        }
+
         val btnParams = WindowManager.LayoutParams(
-            150, 150, // วงกลมขนาด 150x150
+            btnPxSize, btnPxSize,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -91,21 +108,23 @@ class OverlayService : Service() {
             y = 300
         }
 
-        // ทำดีไซน์ปุ่มลอยวงกลมทรงสวยงาม
         val circleBg = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            setColor(0xDD00E676.toInt()) // สีเขียวนีออนโปร่งแสงนิดๆ
-            setStroke(4, 0xFFFFFFFF.toInt())
+            setColor(Color.argb(alphaValue, 0, 230, 118))
+            setStroke(4, Color.argb(alphaValue, 255, 255, 255))
         }
 
         floatingButton = TextView(this).apply {
             text = "🌐"
-            textSize = 22f
+            textSize = when (btnSizeIndex) {
+                0 -> 18f
+                2 -> 26f
+                else -> 22f
+            }
             gravity = Gravity.CENTER
             background = circleBg
         }
 
-        // ระบบจับ Touch event (ลากได้ + Single/Double Click)
         floatingButton.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0
             private var initialY = 0
@@ -131,16 +150,15 @@ class OverlayService : Service() {
                         val diffX = Math.abs(event.rawX - initialTouchX)
                         val diffY = Math.abs(event.rawY - initialTouchY)
                         if (diffX < 10 && diffY < 10) {
+                            val isDoubleClickEnabled = prefs.getBoolean("enable_double_click", true)
                             val clickTime = System.currentTimeMillis()
-                            if (clickTime - lastClickTime < 300) {
-                                // Double Click
-                                if (isDoubleClickEnabled) {
-                                    closeSubMenu()
+
+                            if (isDoubleClickEnabled) {
+                                if (clickTime - lastClickTime < 300) {
                                     captureAndTranslate()
                                 }
                             } else {
-                                // Single Click
-                                toggleSubMenu(btnParams.x, btnParams.y)
+                                captureAndTranslate()
                             }
                             lastClickTime = clickTime
                         }
@@ -152,64 +170,6 @@ class OverlayService : Service() {
         })
 
         windowManager.addView(floatingButton, btnParams)
-    }
-
-    private fun toggleSubMenu(btnX: Int, btnY: Int) {
-        if (subMenuView != null) {
-            closeSubMenu()
-            return
-        }
-
-        val menuParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = btnX + 160
-            y = btnY
-        }
-
-        subMenuView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(20, 20, 20, 20)
-            setBackgroundColor(0xEE222222.toInt())
-
-            val btnToggleDbClick = Button(this@OverlayService).apply {
-                text = if (isDoubleClickEnabled) "🟢 ปิดดับเบิลคลิกแปล" else "🔴 เปิดดับเบิลคลิกแปล"
-                textSize = 12f
-                setOnClickListener {
-                    isDoubleClickEnabled = !isDoubleClickEnabled
-                    text = if (isDoubleClickEnabled) "🟢 ปิดดับเบิลคลิกแปล" else "🔴 เปิดดับเบิลคลิกแปล"
-                }
-            }
-
-            val btnBackToApp = Button(this@OverlayService).apply {
-                text = "📱 กลับเข้าแอปหลัก"
-                textSize = 12f
-                setOnClickListener {
-                    val intent = Intent(this@OverlayService, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    startActivity(intent)
-                    closeSubMenu()
-                }
-            }
-
-            addView(btnToggleDbClick)
-            addView(btnBackToApp)
-        }
-
-        windowManager.addView(subMenuView, menuParams)
-    }
-
-    private fun closeSubMenu() {
-        subMenuView?.let {
-            try { windowManager.removeView(it) } catch (e: Exception) {}
-            subMenuView = null
-        }
     }
 
     private fun captureAndTranslate() {
@@ -268,16 +228,20 @@ class OverlayService : Service() {
         )
 
         val container = FrameLayout(this).apply {
-            setBackgroundColor(0x55000000.toInt())
+            setBackgroundColor(0x77000000.toInt())
             setOnClickListener { removeResultOverlay() }
         }
 
         val tv = TextView(this).apply {
             this.text = text
-            setPadding(50, 50, 50, 50)
-            setBackgroundColor(0xEE111111.toInt())
-            setTextColor(0xFF00E676.toInt())
-            textSize = 16f
+            setPadding(48, 48, 48, 48)
+            background = GradientDrawable().apply {
+                setColor(0xEE1E1E1E.toInt())
+                cornerRadius = 24f
+                setStroke(2, 0xFF00E676.toInt())
+            }
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 15f
         }
 
         val tvParams = FrameLayout.LayoutParams(
@@ -285,7 +249,7 @@ class OverlayService : Service() {
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.BOTTOM
-            setMargins(30, 30, 30, 100)
+            setMargins(32, 32, 32, 120)
         }
 
         container.addView(tv, tvParams)
@@ -302,7 +266,6 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        closeSubMenu()
         removeResultOverlay()
         if (::floatingButton.isInitialized) {
             try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
