@@ -4,6 +4,7 @@ import android.animation.ObjectAnimator
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
@@ -20,7 +21,6 @@ import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import android.view.*
-import android.animation.TimeInterpolator
 import android.view.animation.LinearInterpolator
 import android.widget.*
 import androidx.core.app.NotificationCompat
@@ -39,8 +39,8 @@ class OverlayService : Service() {
     private var resultOverlay: View? = null
 
     private var mediaProjection: MediaProjection? = null
-    private var imageReader: ImageReader? = null
-    private var virtualDisplay: VirtualDisplay? = null
+    private var serviceResultCode: Int = -1
+    private var serviceData: Intent? = null
 
     private var lastClickTime = 0L
     private val handler = Handler(Looper.getMainLooper())
@@ -51,7 +51,6 @@ class OverlayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         
-        // ตรวจสอบสิทธิ์ Overlay ก่อนเริ่ม
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "⚠️ ไม่ได้รับสิทธิ์การแสดงผลทับหน้าจอ (Overlay)", Toast.LENGTH_LONG).show()
             stopSelf()
@@ -60,14 +59,18 @@ class OverlayService : Service() {
 
         startForegroundServiceNotification()
 
-        val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
-        val data = intent?.getParcelableExtra<Intent>("data")
+        serviceResultCode = intent?.getIntExtra("resultCode", -1) ?: -1
+        serviceData = intent?.getParcelableExtra<Intent>("data")
 
-        if (resultCode != -1 && data != null) {
+        if (serviceResultCode != -1 && serviceData != null) {
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, data)
-            mediaProjection?.registerCallback(object : MediaProjection.Callback() {}, null)
-            setupVirtualDisplay()
+            mediaProjection = projectionManager.getMediaProjection(serviceResultCode, serviceData!!)
+            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    super.onStop()
+                    mediaProjection = null
+                }
+            }, handler)
         }
 
         setupFloatingButton()
@@ -86,31 +89,19 @@ class OverlayService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Overlay Translator Active")
-            .setContentText("ระบบแปลภาษาบนหน้าจอกำลังทำงาน...")
+            .setContentText("ระบบแปลหน้าจอกำลังทำงาน...")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
-        startForeground(NOTIFICATION_ID, notification)
-    }
-
-    private fun setupVirtualDisplay() {
-        // ใช้ resources.displayMetrics ปลอดภัยและไม่ Deprecated
-        val dm = resources.displayMetrics
-        val width = dm.widthPixels
-        val height = dm.heightPixels
-        val density = dm.densityDpi
-
-        try {
-            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "ScreenCapture",
-                width, height, density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader?.surface, null, null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             )
-        } catch (e: Exception) {
-            Log.e(TAG, "Error setting up VirtualDisplay: ${e.message}", e)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
@@ -132,7 +123,6 @@ class OverlayService : Service() {
             else -> 204
         }
 
-        // ดึงตำแหน่งที่เคยบันทึกไว้ล่าสุด
         val savedX = prefs.getInt("btn_x", 100)
         val savedY = prefs.getInt("btn_y", 300)
 
@@ -172,7 +162,7 @@ class OverlayService : Service() {
             private var initialTouchY = 0f
 
             override fun onTouch(v: View?, event: MotionEvent): Boolean {
-                if (isTranslating) return true // ล็อกปุ่มขณะกำลังแปล
+                if (isTranslating) return true
 
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
@@ -193,7 +183,6 @@ class OverlayService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
-                        // บันทึกตำแหน่งล่าสุดลง SharedPreferences
                         prefs.edit()
                             .putInt("btn_x", btnParams.x)
                             .putInt("btn_y", btnParams.y)
@@ -207,11 +196,9 @@ class OverlayService : Service() {
 
                             if (isDoubleClickEnabled) {
                                 if (clickTime - lastClickTime < 500) {
-                                    startLoadingAnimation()
                                     captureAndTranslate()
                                 }
                             } else {
-                                startLoadingAnimation()
                                 captureAndTranslate()
                             }
                             lastClickTime = clickTime
@@ -267,25 +254,59 @@ class OverlayService : Service() {
     }
 
     private fun captureAndTranslate() {
-        if (mediaProjection == null || imageReader == null) {
+        startLoadingAnimation()
+
+        if (mediaProjection == null && serviceResultCode != -1 && serviceData != null) {
+            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = projectionManager.getMediaProjection(serviceResultCode, serviceData!!)
+        }
+
+        if (mediaProjection == null) {
             resetLoadingAnimation()
             Toast.makeText(this, "⚠️ ไม่พบสิทธิ์การแคปหน้าจอ กรุณาปิดและเปิดปุ่มลอยใหม่", Toast.LENGTH_SHORT).show()
             return
         }
 
-        // ระบบ Retry 3 ครั้ง เพื่อป้องกัน Buffer ว่างเปล่าบน Android 14/15
+        val dm = resources.displayMetrics
+        val width = dm.widthPixels
+        val height = dm.heightPixels
+        val density = dm.densityDpi
+
+        var imageReader: ImageReader? = null
+        var virtualDisplay: VirtualDisplay? = null
         var image: android.media.Image? = null
-        for (i in 1..3) {
-            try {
-                image = imageReader?.acquireLatestImage() ?: imageReader?.acquireNextImage()
-                if (image != null) break
-            } catch (e: Exception) {
-                Log.e(TAG, "Attempt $i failed: ${e.message}")
+
+        try {
+            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "ScreenCapture",
+                width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader.surface, null, null
+            )
+
+            for (i in 1..3) {
+                try {
+                    image = imageReader.acquireLatestImage() ?: imageReader.acquireNextImage()
+                    if (image != null) break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Attempt $i failed: ${e.message}")
+                }
+                SystemClock.sleep(150)
             }
-            SystemClock.sleep(150)
+
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException: ${e.message}", e)
+            handler.post {
+                Toast.makeText(this, "❌ mediaProjection SecurityException: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting up VirtualDisplay: ${e.message}", e)
         }
 
         if (image == null) {
+            virtualDisplay?.release()
+            imageReader?.close()
             resetLoadingAnimation()
             Toast.makeText(this, "⚠️ ไม่สามารถแคปภาพได้ กรุณาปิดแล้วเปิดปุ่มลอยใหม่", Toast.LENGTH_SHORT).show()
             return
@@ -295,6 +316,9 @@ class OverlayService : Service() {
         try {
             val planes = image.planes
             if (planes.isEmpty()) {
+                image.close()
+                virtualDisplay?.release()
+                imageReader?.close()
                 resetLoadingAnimation()
                 return
             }
@@ -318,6 +342,8 @@ class OverlayService : Service() {
             return
         } finally {
             try { image.close() } catch (ignored: Exception) {}
+            try { virtualDisplay?.release() } catch (ignored: Exception) {}
+            try { imageReader?.close() } catch (ignored: Exception) {}
         }
 
         val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
@@ -402,7 +428,6 @@ class OverlayService : Service() {
         if (::floatingButton.isInitialized) {
             try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
         }
-        virtualDisplay?.release()
         mediaProjection?.stop()
     }
 }
