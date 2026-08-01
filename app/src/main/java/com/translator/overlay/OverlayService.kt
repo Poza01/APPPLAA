@@ -36,6 +36,7 @@ class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var floatingButton: TextView
+    private var subMenuView: LinearLayout? = null
     private var resultOverlay: View? = null
 
     private var mediaProjection: MediaProjection? = null
@@ -183,6 +184,7 @@ class OverlayService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
+                        // save position
                         prefs.edit()
                             .putInt("btn_x", btnParams.x)
                             .putInt("btn_y", btnParams.y)
@@ -191,17 +193,8 @@ class OverlayService : Service() {
                         val diffX = Math.abs(event.rawX - initialTouchX)
                         val diffY = Math.abs(event.rawY - initialTouchY)
                         if (diffX < 10 && diffY < 10) {
-                            val isDoubleClickEnabled = prefs.getBoolean("enable_double_click", true)
-                            val clickTime = System.currentTimeMillis()
-
-                            if (isDoubleClickEnabled) {
-                                if (clickTime - lastClickTime < 500) {
-                                    captureAndTranslate()
-                                }
-                            } else {
-                                captureAndTranslate()
-                            }
-                            lastClickTime = clickTime
+                            // Single click: open submenu with actions
+                            toggleSubMenu(btnParams.x, btnParams.y)
                         }
                         return true
                     }
@@ -218,6 +211,79 @@ class OverlayService : Service() {
             stopSelf()
         } catch (e: Exception) {
             Log.e(TAG, "Error adding view: ${e.message}")
+        }
+    }
+
+    private fun toggleSubMenu(btnX: Int, btnY: Int) {
+        if (subMenuView != null) {
+            closeSubMenu()
+            return
+        }
+
+        val menuParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = btnX + 180
+            y = btnY
+        }
+
+        subMenuView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20, 20, 20, 20)
+            background = GradientDrawable().apply {
+                setColor(0xEE222222.toInt())
+                cornerRadius = 16f
+                setStroke(2, 0xFF333333.toInt())
+            }
+
+            val btnTranslate = Button(this@OverlayService).apply {
+                text = "🔍 แปลหน้าจอ"
+                setOnClickListener {
+                    // start translating and close menu
+                    startLoadingAnimation()
+                    closeSubMenu()
+                    captureAndTranslate()
+                }
+            }
+
+            val btnBackToApp = Button(this@OverlayService).apply {
+                text = "📱 กลับเข้าแอป"
+                setOnClickListener {
+                    val intent = Intent(this@OverlayService, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    startActivity(intent)
+                    closeSubMenu()
+                }
+            }
+
+            val btnClose = Button(this@OverlayService).apply {
+                text = "✖ ปิดเมนู"
+                setOnClickListener { closeSubMenu() }
+            }
+
+            addView(btnTranslate)
+            addView(btnBackToApp)
+            addView(btnClose)
+        }
+
+        try {
+            windowManager.addView(subMenuView, menuParams)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding submenu: ${e.message}")
+            subMenuView = null
+        }
+    }
+
+    private fun closeSubMenu() {
+        subMenuView?.let {
+            try { windowManager.removeView(it) } catch (e: Exception) {}
+            subMenuView = null
         }
     }
 
@@ -254,7 +320,7 @@ class OverlayService : Service() {
     }
 
     private fun captureAndTranslate() {
-        startLoadingAnimation()
+        // startLoadingAnimation() is already called by caller (submenu) before invoking this
 
         if (mediaProjection == null && serviceResultCode != -1 && serviceData != null) {
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -263,7 +329,7 @@ class OverlayService : Service() {
 
         if (mediaProjection == null) {
             resetLoadingAnimation()
-            Toast.makeText(this, "⚠️ ไม่พบสิทธิ์การแคปหน้าจอ กรุณาปิดและเปิดปุ่มลอยใหม่", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "⚠️ ไม่พบสิทธิ์การแคปหน้าจอ กรุณาปิดและเปิดปุ่มลอยใหม่", Toast.LENGTH_LONG).show()
             return
         }
 
@@ -424,6 +490,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         removeResultOverlay()
+        closeSubMenu()
         resetLoadingAnimation()
         if (::floatingButton.isInitialized) {
             try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
