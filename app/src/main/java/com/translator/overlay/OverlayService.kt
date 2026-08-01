@@ -251,6 +251,19 @@ class OverlayService : Service() {
                 }
             }
 
+            val btnRequestCapture = Button(this@OverlayService).apply {
+                text = "🔁 รี-ขอ Screen Capture"
+                setOnClickListener {
+                    // open MainActivity to request screen capture intent
+                    val intent = Intent(this@OverlayService, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        putExtra("request_media_projection", true)
+                    }
+                    startActivity(intent)
+                    closeSubMenu()
+                }
+            }
+
             val btnBackToApp = Button(this@OverlayService).apply {
                 text = "📱 กลับเข้าแอป"
                 setOnClickListener {
@@ -268,6 +281,7 @@ class OverlayService : Service() {
             }
 
             addView(btnTranslate)
+            addView(btnRequestCapture)
             addView(btnBackToApp)
             addView(btnClose)
         }
@@ -328,8 +342,14 @@ class OverlayService : Service() {
         }
 
         if (mediaProjection == null) {
+            // try to re-request screen capture by opening MainActivity which will call createScreenCaptureIntent
             resetLoadingAnimation()
-            Toast.makeText(this, "⚠️ ไม่พบสิทธิ์การแคปหน้าจอ กรุณาปิดและเปิดปุ่มลอยใหม่", Toast.LENGTH_LONG).show()
+            val intent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra("request_media_projection", true)
+            }
+            startActivity(intent)
+            Toast.makeText(this, "❗ กรุณาอนุญาต Screen Capture ในหน้าจอที่ขึ้นมา", Toast.LENGTH_LONG).show()
             return
         }
 
