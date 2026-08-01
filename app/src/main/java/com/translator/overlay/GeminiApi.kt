@@ -48,7 +48,6 @@ object GeminiApi {
                 })
             ))
             
-            // เพิ่มการตั้งค่า Thinking Config ถ้าเลือกใช้งาน
             if (thinkingLevel != "off") {
                 put("thinkingConfig", JSONObject().apply {
                     put("thinkingLevel", thinkingLevel)
@@ -63,13 +62,11 @@ object GeminiApi {
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                // ถ้าสัญญานหลุด ให้ลอง Key ถัดไป
                 tryNextKey(keysList, currentIndex + 1, model, thinkingLevel, customPrompt, base64Image, callback)
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
-                    // ถ้า Key นี้ติด Error / Quota ให้สลับไปลอง Key ถัดไปทันที
                     tryNextKey(keysList, currentIndex + 1, model, thinkingLevel, customPrompt, base64Image, callback)
                     return
                 }
@@ -86,7 +83,6 @@ object GeminiApi {
                     
                     callback(result)
                 } catch (e: Exception) {
-                    // ถ้าโครงสร้าง Json พังหรือ Key มีปัญหา วนไป Key ถัดไป
                     tryNextKey(keysList, currentIndex + 1, model, thinkingLevel, customPrompt, base64Image, callback)
                 }
             }
