@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
@@ -266,11 +267,22 @@ class OverlayService : Service() {
     }
 
     private fun captureAndTranslate() {
-        val image = try {
-            imageReader?.acquireLatestImage()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error acquiring image: ${e.message}")
-            null
+        if (mediaProjection == null || imageReader == null) {
+            resetLoadingAnimation()
+            Toast.makeText(this, "⚠️ ไม่พบสิทธิ์การแคปหน้าจอ กรุณาปิดและเปิดปุ่มลอยใหม่", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // ระบบ Retry 3 ครั้ง เพื่อป้องกัน Buffer ว่างเปล่าบน Android 14/15
+        var image: android.media.Image? = null
+        for (i in 1..3) {
+            try {
+                image = imageReader?.acquireLatestImage() ?: imageReader?.acquireNextImage()
+                if (image != null) break
+            } catch (e: Exception) {
+                Log.e(TAG, "Attempt $i failed: ${e.message}")
+            }
+            SystemClock.sleep(150)
         }
 
         if (image == null) {
