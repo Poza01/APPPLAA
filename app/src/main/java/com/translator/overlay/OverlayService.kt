@@ -1,16 +1,12 @@
 package com.translator.overlay
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
+import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
+import android.graphics.*
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -18,33 +14,29 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Base64
 import android.util.DisplayMetrics
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
-import android.view.WindowManager
-import android.widget.Button
-import android.widget.FrameLayout
-import android.widget.TextView
-import android.widget.Toast
+import android.view.*
+import android.widget.*
 import androidx.core.app.NotificationCompat
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var floatingButton: Button
+    private lateinit var floatingButton: TextView
+    private var subMenuView: LinearLayout? = null
     private var resultOverlay: View? = null
+
     private var mediaProjection: MediaProjection? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var btnLayoutParams: WindowManager.LayoutParams? = null
+
+    private var isDoubleClickEnabled = true
+    private var lastClickTime = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
         startForegroundServiceNotification()
 
         val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
@@ -57,7 +49,7 @@ class OverlayService : Service() {
             setupVirtualDisplay()
         }
 
-        setupOverlayViews()
+        setupFloatingButton()
         return START_STICKY
     }
 
@@ -87,10 +79,9 @@ class OverlayService : Service() {
         )
     }
 
-    private fun setupOverlayViews() {
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+    private fun setupFloatingButton() {
+        val btnParams = WindowManager.LayoutParams(
+            150, 150, // วงกลมขนาด 150x150
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -99,89 +90,166 @@ class OverlayService : Service() {
             x = 100
             y = 300
         }
-        btnLayoutParams = params
 
-        floatingButton = Button(this).apply {
-            text = "🌐 แปลหน้าจอ"
+        // ทำดีไซน์ปุ่มลอยวงกลมทรงสวยงาม
+        val circleBg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xDD00E676.toInt()) // สีเขียวนีออนโปร่งแสงนิดๆ
+            setStroke(4, 0xFFFFFFFF.toInt())
         }
 
-        var initialX = 0
-        var initialY = 0
-        var touchX = 0f
-        var touchY = 0f
-        var downTime = 0L
+        floatingButton = TextView(this).apply {
+            text = "🌐"
+            textSize = 22f
+            gravity = Gravity.CENTER
+            background = circleBg
+        }
 
-        floatingButton.setOnTouchListener { v, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downTime = System.currentTimeMillis()
-                    initialX = btnLayoutParams?.x ?: 0
-                    initialY = btnLayoutParams?.y ?: 0
-                    touchX = event.rawX
-                    touchY = event.rawY
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - touchX).toInt()
-                    val dy = (event.rawY - touchY).toInt()
-                    btnLayoutParams?.x = initialX + dx
-                    btnLayoutParams?.y = initialY + dy
-                    try {
-                        windowManager.updateViewLayout(floatingButton, btnLayoutParams)
-                    } catch (e: Exception) { }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    val upTime = System.currentTimeMillis()
-                    val timeDiff = upTime - downTime
-                    if (timeDiff < 200 && Math.abs((btnLayoutParams?.x ?: 0) - initialX) < 10 && Math.abs((btnLayoutParams?.y ?: 0) - initialY) < 10) {
-                        captureAndTranslate()
+        // ระบบจับ Touch event (ลากได้ + Single/Double Click)
+        floatingButton.setOnTouchListener(object : View.OnTouchListener {
+            private var initialX = 0
+            private var initialY = 0
+            private var initialTouchX = 0f
+            private var initialTouchY = 0f
+
+            override fun onTouch(v: View?, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        initialX = btnParams.x
+                        initialY = btnParams.y
+                        initialTouchX = event.rawX
+                        initialTouchY = event.rawY
+                        return true
                     }
-                    true
+                    MotionEvent.ACTION_MOVE -> {
+                        btnParams.x = initialX + (event.rawX - initialTouchX).toInt()
+                        btnParams.y = initialY + (event.rawY - initialTouchY).toInt()
+                        windowManager.updateViewLayout(floatingButton, btnParams)
+                        return true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val diffX = Math.abs(event.rawX - initialTouchX)
+                        val diffY = Math.abs(event.rawY - initialTouchY)
+                        if (diffX < 10 && diffY < 10) {
+                            val clickTime = System.currentTimeMillis()
+                            if (clickTime - lastClickTime < 300) {
+                                // Double Click
+                                if (isDoubleClickEnabled) {
+                                    closeSubMenu()
+                                    captureAndTranslate()
+                                }
+                            } else {
+                                // Single Click
+                                toggleSubMenu(btnParams.x, btnParams.y)
+                            }
+                            lastClickTime = clickTime
+                        }
+                        return true
+                    }
                 }
-                else -> false
+                return false
             }
-        }
+        })
 
-        try {
-            windowManager.addView(floatingButton, params)
-        } catch (e: Exception) { }
+        windowManager.addView(floatingButton, btnParams)
     }
 
-    private fun captureAndTranslate() {
-        val image: Image? = imageReader?.acquireLatestImage()
-        if (image == null) {
-            Toast.makeText(this, "แตะปุ่มอีกครั้ง...", Toast.LENGTH_SHORT).show()
+    private fun toggleSubMenu(btnX: Int, btnY: Int) {
+        if (subMenuView != null) {
+            closeSubMenu()
             return
         }
 
-        val width = image.width
-        val height = image.height
-        val plane = image.planes[0]
-        val buffer: ByteBuffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * width
+        val menuParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = btnX + 160
+            y = btnY
+        }
 
-        val bitmapWidth = width + rowPadding / pixelStride
-        val bitmap = Bitmap.createBitmap(bitmapWidth, height, Bitmap.Config.ARGB_8888)
-        bitmap.copyPixelsFromBuffer(buffer)
-        val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height)
+        subMenuView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20, 20, 20, 20)
+            setBackgroundColor(0xEE222222.toInt())
+
+            val btnToggleDbClick = Button(this@OverlayService).apply {
+                text = if (isDoubleClickEnabled) "🟢 ปิดดับเบิลคลิกแปล" else "🔴 เปิดดับเบิลคลิกแปล"
+                textSize = 12f
+                setOnClickListener {
+                    isDoubleClickEnabled = !isDoubleClickEnabled
+                    text = if (isDoubleClickEnabled) "🟢 ปิดดับเบิลคลิกแปล" else "🔴 เปิดดับเบิลคลิกแปล"
+                }
+            }
+
+            val btnBackToApp = Button(this@OverlayService).apply {
+                text = "📱 กลับเข้าแอปหลัก"
+                textSize = 12f
+                setOnClickListener {
+                    val intent = Intent(this@OverlayService, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    startActivity(intent)
+                    closeSubMenu()
+                }
+            }
+
+            addView(btnToggleDbClick)
+            addView(btnBackToApp)
+        }
+
+        windowManager.addView(subMenuView, menuParams)
+    }
+
+    private fun closeSubMenu() {
+        subMenuView?.let {
+            try { windowManager.removeView(it) } catch (e: Exception) {}
+            subMenuView = null
+        }
+    }
+
+    private fun captureAndTranslate() {
+        val image = imageReader?.acquireLatestImage()
+        if (image == null) {
+            Toast.makeText(this, "กดใหม่อีกครั้ง...", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val planes = image.planes
+        val buffer = planes[0].buffer
+        val pixelStride = planes[0].pixelStride
+        val rowStride = planes[0].rowStride
+        val rowPadding = rowStride - pixelStride * image.width
+
+        val fullBitmap = Bitmap.createBitmap(image.width + rowPadding / pixelStride, image.height, Bitmap.Config.ARGB_8888)
+        fullBitmap.copyPixelsFromBuffer(buffer)
+        val croppedBitmap = Bitmap.createBitmap(fullBitmap, 0, 0, image.width, image.height)
         image.close()
 
         val byteArrayOutputStream = ByteArrayOutputStream()
         croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 60, byteArrayOutputStream)
         val base64Image = Base64.encodeToString(byteArrayOutputStream.toByteArray(), Base64.NO_WRAP)
 
-        val apiKey = getSharedPreferences("prefs", Context.MODE_PRIVATE).getString("api_key", "") ?: ""
-        if (apiKey.isEmpty()) {
+        val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
+        val rawKeys = prefs.getString("api_keys", "") ?: ""
+        val keysList = rawKeys.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+
+        if (keysList.isEmpty()) {
             Toast.makeText(this, "กรุณากรอก API Key ในแอปก่อน", Toast.LENGTH_SHORT).show()
             return
         }
 
-        Toast.makeText(this, "กำลังแปล...", Toast.LENGTH_SHORT).show()
+        val model = prefs.getString("selected_model", "gemini-3.1-flash-lite") ?: "gemini-3.1-flash-lite"
+        val thinking = prefs.getString("thinking_level", "off") ?: "off"
+        val customPrompt = prefs.getString("custom_prompt", "อ่านและแปลภาพนี้เป็นภาษาไทย") ?: ""
 
-        GeminiApi.translateImage(apiKey, base64Image) { translatedText ->
+        Toast.makeText(this, "กำลังสแกนแปล...", Toast.LENGTH_SHORT).show()
+
+        GeminiApi.translateWithMultiKeys(keysList, model, thinking, customPrompt, base64Image) { translatedText ->
             floatingButton.post {
                 showFullScreenResultOverlay(translatedText)
             }
@@ -201,16 +269,14 @@ class OverlayService : Service() {
 
         val container = FrameLayout(this).apply {
             setBackgroundColor(0x55000000.toInt())
-            setOnClickListener {
-                removeResultOverlay()
-            }
+            setOnClickListener { removeResultOverlay() }
         }
 
         val tv = TextView(this).apply {
             this.text = text
             setPadding(50, 50, 50, 50)
             setBackgroundColor(0xEE111111.toInt())
-            setTextColor(0xFFFFFFFF.toInt())
+            setTextColor(0xFF00E676.toInt())
             textSize = 16f
         }
 
@@ -224,22 +290,19 @@ class OverlayService : Service() {
 
         container.addView(tv, tvParams)
         resultOverlay = container
-        try {
-            windowManager.addView(resultOverlay, params)
-        } catch (e: Exception) { }
+        windowManager.addView(resultOverlay, params)
     }
 
     private fun removeResultOverlay() {
         resultOverlay?.let {
-            try {
-                windowManager.removeView(it)
-            } catch (e: Exception) {}
+            try { windowManager.removeView(it) } catch (e: Exception) {}
             resultOverlay = null
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        closeSubMenu()
         removeResultOverlay()
         if (::floatingButton.isInitialized) {
             try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
