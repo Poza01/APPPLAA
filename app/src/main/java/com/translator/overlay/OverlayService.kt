@@ -43,6 +43,13 @@ class OverlayService : Service() {
     private var serviceResultCode: Int = -1
     private var serviceData: Intent? = null
 
+    // Android 14+: createVirtualDisplay() ใช้ได้แค่ครั้งเดียวต่อ MediaProjection instance
+    // ต้องสร้าง VirtualDisplay/ImageReader ครั้งเดียวแล้วใช้ซ้ำตลอดอายุของ session นี้
+    private var persistentImageReader: ImageReader? = null
+    private var persistentVirtualDisplay: VirtualDisplay? = null
+    private var capturedWidth = 0
+    private var capturedHeight = 0
+
     private var lastClickTime = 0L
     private val handler = Handler(Looper.getMainLooper())
     private var isTranslating = false
@@ -60,22 +67,81 @@ class OverlayService : Service() {
 
         startForegroundServiceNotification()
 
-        serviceResultCode = intent?.getIntExtra("resultCode", -1) ?: -1
-        serviceData = intent?.getParcelableExtra<Intent>("data")
+        val newResultCode = intent?.getIntExtra("resultCode", -1) ?: -1
+        val newData = intent?.getParcelableExtra<Intent>("data")
+        val autoRetry = intent?.getBooleanExtra("auto_retry", false) ?: false
 
-        if (serviceResultCode != -1 && serviceData != null) {
-            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(serviceResultCode, serviceData!!)
-            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    super.onStop()
-                    mediaProjection = null
-                }
-            }, handler)
+        if (newResultCode != -1 && newData != null) {
+            serviceResultCode = newResultCode
+            serviceData = newData
+            setupMediaProjection(autoRetry)
         }
 
-        setupFloatingButton()
+        // ป้องกันการเพิ่มปุ่มลอยซ้ำซ้อน กรณี service ทำงานอยู่แล้วแล้วมี intent
+        // ใหม่เข้ามา (เช่น ขอสิทธิ์ Screen Capture ใหม่อัตโนมัติ)
+        if (!::floatingButton.isInitialized) {
+            setupFloatingButton()
+        }
         return START_STICKY
+    }
+
+    private fun setupMediaProjection(autoRetry: Boolean) {
+        // เคลียร์ของเก่าทิ้งก่อนเสมอ ทั้ง VirtualDisplay/ImageReader และ MediaProjection ตัวก่อนหน้า
+        releasePersistentCapture()
+        try { mediaProjection?.stop() } catch (ignored: Exception) {}
+        mediaProjection = null
+
+        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = projectionManager.getMediaProjection(serviceResultCode, serviceData!!)
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                super.onStop()
+                releasePersistentCapture()
+                mediaProjection = null
+            }
+        }, handler)
+
+        setupPersistentVirtualDisplay()
+
+        if (autoRetry) {
+            // ผู้ใช้เพิ่งกดแปล แล้วต้องขอสิทธิ์ใหม่ระหว่างทาง พอได้สิทธิ์แล้วให้แปลต่อให้ทันที
+            handler.postDelayed({
+                if (::floatingButton.isInitialized) {
+                    startLoadingAnimation()
+                    captureAndTranslate()
+                }
+            }, 300)
+        }
+    }
+
+    /**
+     * สร้าง VirtualDisplay + ImageReader "ครั้งเดียว" ต่อ MediaProjection session ตามคำแนะนำของ Android
+     * (ห้ามเรียก createVirtualDisplay ซ้ำกับ MediaProjection instance เดิม มิฉะนั้น session จะถูกเพิกถอนสิทธิ์)
+     */
+    private fun setupPersistentVirtualDisplay() {
+        val dm = resources.displayMetrics
+        capturedWidth = dm.widthPixels
+        capturedHeight = dm.heightPixels
+        val density = dm.densityDpi
+
+        try {
+            persistentImageReader = ImageReader.newInstance(capturedWidth, capturedHeight, PixelFormat.RGBA_8888, 2)
+            persistentVirtualDisplay = mediaProjection?.createVirtualDisplay(
+                "ScreenCapture",
+                capturedWidth, capturedHeight, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                persistentImageReader?.surface, null, null
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating persistent VirtualDisplay: ${e.message}", e)
+        }
+    }
+
+    private fun releasePersistentCapture() {
+        try { persistentVirtualDisplay?.release() } catch (ignored: Exception) {}
+        try { persistentImageReader?.close() } catch (ignored: Exception) {}
+        persistentVirtualDisplay = null
+        persistentImageReader = null
     }
 
     private fun startForegroundServiceNotification() {
@@ -336,63 +402,44 @@ class OverlayService : Service() {
     private fun captureAndTranslate() {
         // startLoadingAnimation() is already called by caller (submenu) before invoking this
 
-        if (mediaProjection == null && serviceResultCode != -1 && serviceData != null) {
-            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(serviceResultCode, serviceData!!)
-        }
-
-        if (mediaProjection == null) {
-            // try to re-request screen capture by opening MainActivity which will call createScreenCaptureIntent
+        if (mediaProjection == null || persistentImageReader == null || persistentVirtualDisplay == null) {
+            // Session หมดอายุ (ปกติของ Android 14+ ที่ virtual display ใช้ได้ครั้งเดียว/หยุดไปเอง)
+            // เปิด MainActivity เพื่อขอสิทธิ์ Screen Capture ใหม่แบบอัตโนมัติ แล้วแปลต่อให้ทันที
             resetLoadingAnimation()
             val intent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra("request_media_projection", true)
             }
             startActivity(intent)
-            Toast.makeText(this, "❗ กรุณาอนุญาต Screen Capture ในหน้าจอที่ขึ้นมา", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "🔒 สิทธิ์ Screen Capture หมดอายุ กำลังขอใหม่ให้อัตโนมัติ...", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val dm = resources.displayMetrics
-        val width = dm.widthPixels
-        val height = dm.heightPixels
-        val density = dm.densityDpi
+        ensureCaptureSizeMatchesScreen()
 
-        var imageReader: ImageReader? = null
-        var virtualDisplay: VirtualDisplay? = null
+        val imageReader = persistentImageReader
         var image: android.media.Image? = null
 
         try {
-            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "ScreenCapture",
-                width, height, density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.surface, null, null
-            )
-
             for (i in 1..3) {
                 try {
-                    image = imageReader.acquireLatestImage() ?: imageReader.acquireNextImage()
+                    image = imageReader?.acquireLatestImage() ?: imageReader?.acquireNextImage()
                     if (image != null) break
                 } catch (e: Exception) {
                     Log.e(TAG, "Attempt $i failed: ${e.message}")
                 }
                 SystemClock.sleep(150)
             }
-
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException: ${e.message}", e)
             handler.post {
                 Toast.makeText(this, "❌ mediaProjection SecurityException: ${e.message}", Toast.LENGTH_LONG).show()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error setting up VirtualDisplay: ${e.message}", e)
+            Log.e(TAG, "Error acquiring image: ${e.message}", e)
         }
 
         if (image == null) {
-            virtualDisplay?.release()
-            imageReader?.close()
             resetLoadingAnimation()
             Toast.makeText(this, "⚠️ ไม่สามารถแคปภาพได้ กรุณาปิดแล้วเปิดปุ่มลอยใหม่", Toast.LENGTH_SHORT).show()
             return
@@ -403,8 +450,6 @@ class OverlayService : Service() {
             val planes = image.planes
             if (planes.isEmpty()) {
                 image.close()
-                virtualDisplay?.release()
-                imageReader?.close()
                 resetLoadingAnimation()
                 return
             }
@@ -428,8 +473,6 @@ class OverlayService : Service() {
             return
         } finally {
             try { image.close() } catch (ignored: Exception) {}
-            try { virtualDisplay?.release() } catch (ignored: Exception) {}
-            try { imageReader?.close() } catch (ignored: Exception) {}
         }
 
         val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
@@ -451,6 +494,31 @@ class OverlayService : Service() {
                 showSuccessAndReset()
                 showFullScreenResultOverlay(translatedText)
             }
+        }
+    }
+
+    /**
+     * ถ้าหน้าจอหมุน/เปลี่ยนขนาดระหว่างใช้งาน ให้ resize VirtualDisplay เดิม + สลับ Surface ใหม่
+     * ตามที่ Android แนะนำ (ห้ามเรียก createVirtualDisplay ซ้ำกับ MediaProjection เดิม)
+     */
+    private fun ensureCaptureSizeMatchesScreen() {
+        val dm = resources.displayMetrics
+        val width = dm.widthPixels
+        val height = dm.heightPixels
+        val density = dm.densityDpi
+
+        if (width == capturedWidth && height == capturedHeight) return
+
+        try {
+            val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            persistentVirtualDisplay?.resize(width, height, density)
+            persistentVirtualDisplay?.surface = newReader.surface
+            persistentImageReader?.close()
+            persistentImageReader = newReader
+            capturedWidth = width
+            capturedHeight = height
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resizing VirtualDisplay: ${e.message}", e)
         }
     }
 
@@ -515,6 +583,7 @@ class OverlayService : Service() {
         if (::floatingButton.isInitialized) {
             try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
         }
+        releasePersistentCapture()
         mediaProjection?.stop()
     }
 }
