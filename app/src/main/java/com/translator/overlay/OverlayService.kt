@@ -58,6 +58,7 @@ class OverlayService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var isTranslating = false
+    private var lastPermissionRequestTime = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -150,8 +151,17 @@ class OverlayService : Service() {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 persistentImageReader?.surface, null, null
             )
+            if (persistentVirtualDisplay == null) {
+                Log.e(TAG, "createVirtualDisplay returned null")
+                handler.post {
+                    Toast.makeText(this, "❌ สร้างหน้าจอแคปไม่สำเร็จ (VirtualDisplay = null)", Toast.LENGTH_LONG).show()
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error creating persistent VirtualDisplay: ${e.message}", e)
+            handler.post {
+                Toast.makeText(this, "❌ ตั้งค่าแคปหน้าจอไม่สำเร็จ: ${e.javaClass.simpleName} - ${e.message}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -344,14 +354,23 @@ class OverlayService : Service() {
 
     private fun captureAndTranslate() {
         if (mediaProjection == null || persistentImageReader == null || persistentVirtualDisplay == null) {
-            // session หมดอายุ -> เปิด MainActivity ขอสิทธิ์ใหม่อัตโนมัติ แล้วแปลต่อให้เอง
             resetLoadingAnimation()
+
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastPermissionRequestTime < 3000) {
+                // เพิ่งขอสิทธิ์ไปเมื่อกี้ อย่าเพิ่งเด้งซ้ำ กันวนลูป
+                Toast.makeText(this, "⏳ กำลังรอสิทธิ์ Screen Capture จากรอบก่อนอยู่ ลองรออีกสักครู่", Toast.LENGTH_SHORT).show()
+                return
+            }
+            lastPermissionRequestTime = now
+
+            // session หมดอายุ หรือสร้างจอแคปไม่สำเร็จ -> เปิด MainActivity ขอสิทธิ์ใหม่อัตโนมัติ
             val intent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra("request_media_projection", true)
             }
             startActivity(intent)
-            Toast.makeText(this, "🔒 สิทธิ์ Screen Capture หมดอายุ กำลังขอใหม่ให้อัตโนมัติ...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "🔒 ต้องขอสิทธิ์ Screen Capture ใหม่ กำลังขอให้อัตโนมัติ...", Toast.LENGTH_SHORT).show()
             return
         }
 
