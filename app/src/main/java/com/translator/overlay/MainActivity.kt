@@ -31,6 +31,9 @@ class MainActivity : AppCompatActivity() {
     private val REQUEST_OVERLAY = 1001
     private val REQUEST_MEDIA_PROJECTION = 1002
 
+    // true เมื่อ Activity นี้ถูกเปิดขึ้นมาจาก OverlayService เพื่อขอ Screen Capture ใหม่แบบอัตโนมัติ
+    private var pendingProjectionRequest = false
+
     private val modelsList = arrayOf(
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
@@ -193,6 +196,37 @@ class MainActivity : AppCompatActivity() {
 
         scrollView.addView(mainLayout)
         setContentView(scrollView)
+
+        handleIncomingIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    /**
+     * เมื่อ MediaProjection หมดอายุ (เกิดขึ้นได้ทุกครั้งบน Android 14+ เพราะแต่ละ session
+     * ใช้ createVirtualDisplay ได้ครั้งเดียว) OverlayService จะเปิดหน้านี้พร้อม extra
+     * "request_media_projection" เพื่อขอสิทธิ์ Screen Capture ใหม่โดยอัตโนมัติ
+     * โดยไม่ต้องให้ผู้ใช้กดปุ่ม "เปิดการทำงานปุ่มลอย" เอง
+     */
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("request_media_projection", false) == true) {
+            pendingProjectionRequest = true
+            requestMediaProjectionOnly()
+        }
+    }
+
+    private fun requestMediaProjectionOnly() {
+        if (!Settings.canDrawOverlays(this)) {
+            // ไม่มีสิทธิ์ overlay แล้ว ให้กลับไปหน้าปกติให้ผู้ใช้กดเปิดเองใหม่
+            pendingProjectionRequest = false
+            return
+        }
+        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(projectionManager.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION)
     }
 
     override fun onResume() {
@@ -307,18 +341,37 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == RESULT_OK && data != null) {
-            val serviceIntent = Intent(this, OverlayService::class.java).apply {
-                putExtra("resultCode", resultCode)
-                putExtra("data", data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
+        if (requestCode == REQUEST_MEDIA_PROJECTION) {
+            if (resultCode == RESULT_OK && data != null) {
+                val serviceIntent = Intent(this, OverlayService::class.java).apply {
+                    putExtra("resultCode", resultCode)
+                    putExtra("data", data)
+                    // สั่งให้ OverlayService แปลหน้าจอซ้ำทันทีที่ได้สิทธิ์ใหม่ กรณีนี้เป็นการขอสิทธิ์
+                    // ใหม่แบบอัตโนมัติ (session เก่าหมดอายุระหว่างใช้งาน)
+                    putExtra("auto_retry", pendingProjectionRequest)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+                updateUiState()
+
+                if (pendingProjectionRequest) {
+                    // ขอสิทธิ์ใหม่ให้อัตโนมัติสำเร็จ พาผู้ใช้กลับไปแอปเดิมทันที ไม่ต้องค้างอยู่หน้านี้
+                    pendingProjectionRequest = false
+                    finish()
+                } else {
+                    Toast.makeText(this, "เปิดใช้งานปุ่มลอยเรียบร้อย!", Toast.LENGTH_SHORT).show()
+                }
             } else {
-                startService(serviceIntent)
+                // ผู้ใช้กดปฏิเสธ/ปิด dialog ระหว่างขอสิทธิ์ใหม่อัตโนมัติ
+                if (pendingProjectionRequest) {
+                    pendingProjectionRequest = false
+                    Toast.makeText(this, "ไม่ได้รับอนุญาต Screen Capture กรุณากดแปลใหม่อีกครั้ง", Toast.LENGTH_LONG).show()
+                    finish()
+                }
             }
-            updateUiState()
-            Toast.makeText(this, "เปิดใช้งานปุ่มลอยเรียบร้อย!", Toast.LENGTH_SHORT).show()
         }
     }
 }
