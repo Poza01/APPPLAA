@@ -26,17 +26,23 @@ import android.widget.*
 import androidx.core.app.NotificationCompat
 import java.io.ByteArrayOutputStream
 
+/**
+ * ปุ่มลอย (floating button) เวอร์ชันย่อ ใช้งานง่าย:
+ *  - แตะ 1 ที (ไม่ลาก) -> แคปหน้าจอ + แปล -> ขึ้นข้อความทับเต็มจอแบบโปร่งแสง
+ *  - ลากปุ่ม -> ย้ายตำแหน่ง
+ *  - ตอนขึ้นผลแปล: ลากนิ้วเพื่อเลื่อนอ่าน, แตะ 1 ที เพื่อปิด
+ */
 class OverlayService : Service() {
 
     private companion object {
         private const val TAG = "OverlayService"
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "overlay_service_channel"
+        private const val TAP_MOVE_THRESHOLD = 12f // px ที่ถือว่ายังเป็นการ "แตะ" ไม่ใช่ "ลาก"
     }
 
     private lateinit var windowManager: WindowManager
     private lateinit var floatingButton: TextView
-    private var subMenuView: LinearLayout? = null
     private var resultOverlay: View? = null
 
     private var mediaProjection: MediaProjection? = null
@@ -44,21 +50,24 @@ class OverlayService : Service() {
     private var serviceData: Intent? = null
 
     // Android 14+: createVirtualDisplay() ใช้ได้แค่ครั้งเดียวต่อ MediaProjection instance
-    // ต้องสร้าง VirtualDisplay/ImageReader ครั้งเดียวแล้วใช้ซ้ำตลอดอายุของ session นี้
+    // สร้างครั้งเดียวแล้วใช้ซ้ำตลอดอายุ session ห้ามสร้างใหม่ทุกครั้งที่แปล
     private var persistentImageReader: ImageReader? = null
     private var persistentVirtualDisplay: VirtualDisplay? = null
     private var capturedWidth = 0
     private var capturedHeight = 0
 
-    private var lastClickTime = 0L
     private val handler = Handler(Looper.getMainLooper())
     private var isTranslating = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    // ---------------------------------------------------------------------
+    // Lifecycle
+    // ---------------------------------------------------------------------
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "⚠️ ไม่ได้รับสิทธิ์การแสดงผลทับหน้าจอ (Overlay)", Toast.LENGTH_LONG).show()
             stopSelf()
@@ -77,16 +86,29 @@ class OverlayService : Service() {
             setupMediaProjection(autoRetry)
         }
 
-        // ป้องกันการเพิ่มปุ่มลอยซ้ำซ้อน กรณี service ทำงานอยู่แล้วแล้วมี intent
-        // ใหม่เข้ามา (เช่น ขอสิทธิ์ Screen Capture ใหม่อัตโนมัติ)
+        // กันปุ่มลอยซ้อนกัน กรณี service ทำงานอยู่แล้วแต่มี intent ใหม่เข้ามา (เช่น รีขอสิทธิ์อัตโนมัติ)
         if (!::floatingButton.isInitialized) {
             setupFloatingButton()
         }
         return START_STICKY
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        removeResultOverlay()
+        resetLoadingAnimation()
+        if (::floatingButton.isInitialized) {
+            try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
+        }
+        releasePersistentCapture()
+        try { mediaProjection?.stop() } catch (ignored: Exception) {}
+    }
+
+    // ---------------------------------------------------------------------
+    // MediaProjection / capture setup
+    // ---------------------------------------------------------------------
+
     private fun setupMediaProjection(autoRetry: Boolean) {
-        // เคลียร์ของเก่าทิ้งก่อนเสมอ ทั้ง VirtualDisplay/ImageReader และ MediaProjection ตัวก่อนหน้า
         releasePersistentCapture()
         try { mediaProjection?.stop() } catch (ignored: Exception) {}
         mediaProjection = null
@@ -104,7 +126,7 @@ class OverlayService : Service() {
         setupPersistentVirtualDisplay()
 
         if (autoRetry) {
-            // ผู้ใช้เพิ่งกดแปล แล้วต้องขอสิทธิ์ใหม่ระหว่างทาง พอได้สิทธิ์แล้วให้แปลต่อให้ทันที
+            // เพิ่งขอสิทธิ์ใหม่เพราะ session เดิมหมดอายุระหว่างกดแปล -> แปลต่อให้ทันที
             handler.postDelayed({
                 if (::floatingButton.isInitialized) {
                     startLoadingAnimation()
@@ -114,10 +136,6 @@ class OverlayService : Service() {
         }
     }
 
-    /**
-     * สร้าง VirtualDisplay + ImageReader "ครั้งเดียว" ต่อ MediaProjection session ตามคำแนะนำของ Android
-     * (ห้ามเรียก createVirtualDisplay ซ้ำกับ MediaProjection instance เดิม มิฉะนั้น session จะถูกเพิกถอนสิทธิ์)
-     */
     private fun setupPersistentVirtualDisplay() {
         val dm = resources.displayMetrics
         capturedWidth = dm.widthPixels
@@ -137,6 +155,27 @@ class OverlayService : Service() {
         }
     }
 
+    /** รองรับกรณีหน้าจอหมุน/เปลี่ยนขนาดโดยไม่ต้องขอสิทธิ์ใหม่ (resize แทน create ใหม่) */
+    private fun ensureCaptureSizeMatchesScreen() {
+        val dm = resources.displayMetrics
+        val width = dm.widthPixels
+        val height = dm.heightPixels
+        val density = dm.densityDpi
+        if (width == capturedWidth && height == capturedHeight) return
+
+        try {
+            val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            persistentVirtualDisplay?.resize(width, height, density)
+            persistentVirtualDisplay?.surface = newReader.surface
+            persistentImageReader?.close()
+            persistentImageReader = newReader
+            capturedWidth = width
+            capturedHeight = height
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resizing VirtualDisplay: ${e.message}", e)
+        }
+    }
+
     private fun releasePersistentCapture() {
         try { persistentVirtualDisplay?.release() } catch (ignored: Exception) {}
         try { persistentImageReader?.close() } catch (ignored: Exception) {}
@@ -147,9 +186,7 @@ class OverlayService : Service() {
     private fun startForegroundServiceNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Overlay Service",
-                NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID, "Overlay Service", NotificationManager.IMPORTANCE_LOW
             )
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
@@ -162,15 +199,15 @@ class OverlayService : Service() {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Floating button: tap = translate, drag = move
+    // ---------------------------------------------------------------------
 
     private fun setupFloatingButton() {
         val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
@@ -250,7 +287,6 @@ class OverlayService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
-                        // save position
                         prefs.edit()
                             .putInt("btn_x", btnParams.x)
                             .putInt("btn_y", btnParams.y)
@@ -258,9 +294,10 @@ class OverlayService : Service() {
 
                         val diffX = Math.abs(event.rawX - initialTouchX)
                         val diffY = Math.abs(event.rawY - initialTouchY)
-                        if (diffX < 10 && diffY < 10) {
-                            // Single click: open submenu with actions
-                            toggleSubMenu(btnParams.x, btnParams.y)
+                        if (diffX < TAP_MOVE_THRESHOLD && diffY < TAP_MOVE_THRESHOLD) {
+                            // แตะ (ไม่ลาก) -> แปลทันที
+                            startLoadingAnimation()
+                            captureAndTranslate()
                         }
                         return true
                     }
@@ -280,93 +317,6 @@ class OverlayService : Service() {
         }
     }
 
-    private fun toggleSubMenu(btnX: Int, btnY: Int) {
-        if (subMenuView != null) {
-            closeSubMenu()
-            return
-        }
-
-        val menuParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = btnX + 180
-            y = btnY
-        }
-
-        subMenuView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(20, 20, 20, 20)
-            background = GradientDrawable().apply {
-                setColor(0xEE222222.toInt())
-                cornerRadius = 16f
-                setStroke(2, 0xFF333333.toInt())
-            }
-
-            val btnTranslate = Button(this@OverlayService).apply {
-                text = "🔍 แปลหน้าจอ"
-                setOnClickListener {
-                    // start translating and close menu
-                    startLoadingAnimation()
-                    closeSubMenu()
-                    captureAndTranslate()
-                }
-            }
-
-            val btnRequestCapture = Button(this@OverlayService).apply {
-                text = "🔁 รี-ขอ Screen Capture"
-                setOnClickListener {
-                    // open MainActivity to request screen capture intent
-                    val intent = Intent(this@OverlayService, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                        putExtra("request_media_projection", true)
-                    }
-                    startActivity(intent)
-                    closeSubMenu()
-                }
-            }
-
-            val btnBackToApp = Button(this@OverlayService).apply {
-                text = "📱 กลับเข้าแอป"
-                setOnClickListener {
-                    val intent = Intent(this@OverlayService, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    startActivity(intent)
-                    closeSubMenu()
-                }
-            }
-
-            val btnClose = Button(this@OverlayService).apply {
-                text = "✖ ปิดเมนู"
-                setOnClickListener { closeSubMenu() }
-            }
-
-            addView(btnTranslate)
-            addView(btnRequestCapture)
-            addView(btnBackToApp)
-            addView(btnClose)
-        }
-
-        try {
-            windowManager.addView(subMenuView, menuParams)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error adding submenu: ${e.message}")
-            subMenuView = null
-        }
-    }
-
-    private fun closeSubMenu() {
-        subMenuView?.let {
-            try { windowManager.removeView(it) } catch (e: Exception) {}
-            subMenuView = null
-        }
-    }
-
     private fun startLoadingAnimation() {
         isTranslating = true
         floatingButton.text = "⏳"
@@ -381,30 +331,20 @@ class OverlayService : Service() {
 
     private fun resetLoadingAnimation(defaultText: String = "🌐") {
         isTranslating = false
+        if (!::floatingButton.isInitialized) return
         val animator = floatingButton.tag as? ObjectAnimator
         animator?.cancel()
         floatingButton.rotation = 0f
         floatingButton.text = defaultText
     }
 
-    private fun showSuccessAndReset() {
-        isTranslating = false
-        val animator = floatingButton.tag as? ObjectAnimator
-        animator?.cancel()
-        floatingButton.rotation = 0f
-        floatingButton.text = "✅"
-        
-        handler.postDelayed({
-            floatingButton.text = "🌐"
-        }, 1500)
-    }
+    // ---------------------------------------------------------------------
+    // Capture + translate
+    // ---------------------------------------------------------------------
 
     private fun captureAndTranslate() {
-        // startLoadingAnimation() is already called by caller (submenu) before invoking this
-
         if (mediaProjection == null || persistentImageReader == null || persistentVirtualDisplay == null) {
-            // Session หมดอายุ (ปกติของ Android 14+ ที่ virtual display ใช้ได้ครั้งเดียว/หยุดไปเอง)
-            // เปิด MainActivity เพื่อขอสิทธิ์ Screen Capture ใหม่แบบอัตโนมัติ แล้วแปลต่อให้ทันที
+            // session หมดอายุ -> เปิด MainActivity ขอสิทธิ์ใหม่อัตโนมัติ แล้วแปลต่อให้เอง
             resetLoadingAnimation()
             val intent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -491,36 +431,15 @@ class OverlayService : Service() {
 
         GeminiApi.translateWithMultiKeys(keysList, model, thinking, customPrompt, base64Image) { translatedText ->
             floatingButton.post {
-                showSuccessAndReset()
+                resetLoadingAnimation()
                 showFullScreenResultOverlay(translatedText)
             }
         }
     }
 
-    /**
-     * ถ้าหน้าจอหมุน/เปลี่ยนขนาดระหว่างใช้งาน ให้ resize VirtualDisplay เดิม + สลับ Surface ใหม่
-     * ตามที่ Android แนะนำ (ห้ามเรียก createVirtualDisplay ซ้ำกับ MediaProjection เดิม)
-     */
-    private fun ensureCaptureSizeMatchesScreen() {
-        val dm = resources.displayMetrics
-        val width = dm.widthPixels
-        val height = dm.heightPixels
-        val density = dm.densityDpi
-
-        if (width == capturedWidth && height == capturedHeight) return
-
-        try {
-            val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-            persistentVirtualDisplay?.resize(width, height, density)
-            persistentVirtualDisplay?.surface = newReader.surface
-            persistentImageReader?.close()
-            persistentImageReader = newReader
-            capturedWidth = width
-            capturedHeight = height
-        } catch (e: Exception) {
-            Log.e(TAG, "Error resizing VirtualDisplay: ${e.message}", e)
-        }
-    }
+    // ---------------------------------------------------------------------
+    // Full-screen translucent result overlay: drag to scroll, tap to dismiss
+    // ---------------------------------------------------------------------
 
     private fun showFullScreenResultOverlay(text: String) {
         removeResultOverlay()
@@ -529,38 +448,43 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         )
 
-        val container = FrameLayout(this).apply {
-            setBackgroundColor(0x77000000.toInt())
-            setOnClickListener { removeResultOverlay() }
-        }
-
         val tv = TextView(this).apply {
             this.text = text
-            setPadding(48, 48, 48, 48)
-            background = GradientDrawable().apply {
-                setColor(0xEE1E1E1E.toInt())
-                cornerRadius = 24f
-                setStroke(2, 0xFF00E676.toInt())
-            }
+            setPadding(48, 96, 48, 96)
             setTextColor(0xFFFFFFFF.toInt())
-            textSize = 15f
+            textSize = 16f
         }
 
-        val tvParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = Gravity.BOTTOM
-            setMargins(32, 32, 32, 120)
+        // ScrollView ทำให้ลากนิ้วเลื่อนอ่านข้อความยาวๆ ได้
+        val scrollView = ScrollView(this).apply {
+            addView(tv, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
 
-        container.addView(tv, tvParams)
+        val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                removeResultOverlay()
+                return true
+            }
+        })
+
+        // ใส่ gesture detector บน scrollView เอง: คืนค่า false เสมอเพื่อให้ ScrollView
+        // ยังคง scroll ตามปกติได้ พร้อมกับตรวจจับ "แตะ 1 ที" เพื่อปิดจอไปด้วย
+        scrollView.setOnTouchListener { _, event ->
+            gestureDetector.onTouchEvent(event)
+            false
+        }
+
+        val container = FrameLayout(this).apply {
+            setBackgroundColor(0xAA000000.toInt()) // จอโปร่งแสงคลุมเต็มหน้าจอ
+            addView(scrollView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
         resultOverlay = container
-        
+
         try {
             windowManager.addView(resultOverlay, params)
         } catch (e: Exception) {
@@ -573,17 +497,5 @@ class OverlayService : Service() {
             try { windowManager.removeView(it) } catch (e: Exception) {}
             resultOverlay = null
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        removeResultOverlay()
-        closeSubMenu()
-        resetLoadingAnimation()
-        if (::floatingButton.isInitialized) {
-            try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
-        }
-        releasePersistentCapture()
-        mediaProjection?.stop()
     }
 }
