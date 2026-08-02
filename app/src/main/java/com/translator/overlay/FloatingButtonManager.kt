@@ -30,6 +30,8 @@ class FloatingButtonManager(
 
     lateinit var floatingButton: TextView
         private set
+    val isButtonInitialized: Boolean
+        get() = ::floatingButton.isInitialized
     private var subMenuView: LinearLayout? = null
     var isTranslating = false
         private set
