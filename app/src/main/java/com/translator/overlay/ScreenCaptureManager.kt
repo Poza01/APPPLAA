@@ -23,7 +23,8 @@ class ScreenCaptureManager(
         private const val TAG = "ScreenCaptureManager"
     }
 
-    var mediaProjection: MediaProjection? = private set
+    var mediaProjection: MediaProjection? = null
+        private set
     private var persistentImageReader: ImageReader? = null
     private var persistentVirtualDisplay: VirtualDisplay? = null
     private var capturedWidth = 0
@@ -115,7 +116,7 @@ class ScreenCaptureManager(
             Log.e(TAG, "Error processing image: ${e.message}", e)
             return null
         } finally {
-            try { image.close() } catch (_: Exception) {}
+            try { image?.close() } catch (_: Exception) {}
         }
     }
 
