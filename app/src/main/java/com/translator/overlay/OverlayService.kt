@@ -72,7 +72,7 @@ class OverlayService : Service() {
             }
         }
 
-        if (!::floatingButtonManager.isInitialized || !floatingButtonManager.floatingButton.isAttachedToWindow) {
+        if (!floatingButtonManager.isButtonInitialized || !floatingButtonManager.floatingButton.isAttachedToWindow) {
             floatingButtonManager.setupFloatingButton {
                 captureAndTranslate()
             }
