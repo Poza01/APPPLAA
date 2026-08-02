@@ -56,9 +56,14 @@ class OverlayService : Service() {
     private var capturedWidth = 0
     private var capturedHeight = 0
 
+    // เก็บเฟรมล่าสุดที่ ImageReader push เข้ามาตลอดเวลา (แทนการ poll/รอด้วย delay)
+    private val frameLock = Any()
+    private var latestFrameBitmap: Bitmap? = null
+
     private val handler = Handler(Looper.getMainLooper())
     private var isTranslating = false
     private var lastPermissionRequestTime = 0L
+    private var isButtonAdded = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -88,7 +93,7 @@ class OverlayService : Service() {
         }
 
         // กันปุ่มลอยซ้อนกัน กรณี service ทำงานอยู่แล้วแต่มี intent ใหม่เข้ามา (เช่น รีขอสิทธิ์อัตโนมัติ)
-        if (!::floatingButton.isInitialized) {
+        if (!isButtonAdded) {
             setupFloatingButton()
         }
         return START_STICKY
@@ -101,6 +106,7 @@ class OverlayService : Service() {
         if (::floatingButton.isInitialized) {
             try { windowManager.removeView(floatingButton) } catch (e: Exception) {}
         }
+        isButtonAdded = false
         releasePersistentCapture()
         try { mediaProjection?.stop() } catch (ignored: Exception) {}
     }
@@ -147,6 +153,7 @@ class OverlayService : Service() {
 
         try {
             persistentImageReader = ImageReader.newInstance(capturedWidth, capturedHeight, PixelFormat.RGBA_8888, 3)
+            attachFrameListener(persistentImageReader!!)
             persistentVirtualDisplay = mediaProjection?.createVirtualDisplay(
                 "ScreenCapture",
                 capturedWidth, capturedHeight, density,
@@ -169,6 +176,40 @@ class OverlayService : Service() {
         }
     }
 
+    /**
+     * แทนที่จะรอ/poll ตอนกดแปล ให้ ImageReader เก็บ "เฟรมล่าสุด" ไว้ตลอดเวลาแทน
+     * ตอนกดแปลแค่หยิบเฟรมที่แคชไว้มาใช้ทันที ไม่ต้องเดาว่าเฟรมมาหรือยัง
+     */
+    private fun attachFrameListener(reader: ImageReader) {
+        reader.setOnImageAvailableListener({ r ->
+            var image: android.media.Image? = null
+            try {
+                image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                val planes = image.planes
+                if (planes.isEmpty()) return@setOnImageAvailableListener
+
+                val buffer = planes[0].buffer
+                val pixelStride = planes[0].pixelStride
+                val rowStride = planes[0].rowStride
+                val rowPadding = rowStride - pixelStride * image.width
+
+                val rawBitmap = Bitmap.createBitmap(image.width + rowPadding / pixelStride, image.height, Bitmap.Config.ARGB_8888)
+                rawBitmap.copyPixelsFromBuffer(buffer)
+                val cropped = if (rowPadding == 0) rawBitmap else Bitmap.createBitmap(rawBitmap, 0, 0, image.width, image.height)
+                if (cropped !== rawBitmap) rawBitmap.recycle()
+
+                synchronized(frameLock) {
+                    latestFrameBitmap?.recycle()
+                    latestFrameBitmap = cropped
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "onImageAvailable error: ${e.message}")
+            } finally {
+                try { image?.close() } catch (ignored: Exception) {}
+            }
+        }, handler)
+    }
+
     /** รองรับกรณีหน้าจอหมุน/เปลี่ยนขนาดโดยไม่ต้องขอสิทธิ์ใหม่ (resize แทน create ใหม่) */
     private fun ensureCaptureSizeMatchesScreen() {
         val dm = resources.displayMetrics
@@ -179,10 +220,20 @@ class OverlayService : Service() {
 
         try {
             val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+            attachFrameListener(newReader)
+
             persistentVirtualDisplay?.resize(width, height, density)
-            persistentVirtualDisplay?.surface = newReader.surface
-            persistentImageReader?.close()
+            persistentVirtualDisplay?.setSurface(newReader.surface)
+
+            val oldReader = persistentImageReader
             persistentImageReader = newReader
+            oldReader?.close()
+
+            synchronized(frameLock) {
+                latestFrameBitmap?.recycle()
+                latestFrameBitmap = null // ขนาดเปลี่ยนแล้ว เฟรมเก่าใช้ไม่ได้ รอเฟรมใหม่จาก listener
+            }
+
             capturedWidth = width
             capturedHeight = height
         } catch (e: Exception) {
@@ -193,10 +244,15 @@ class OverlayService : Service() {
     }
 
     private fun releasePersistentCapture() {
+        try { persistentImageReader?.setOnImageAvailableListener(null, null) } catch (ignored: Exception) {}
         try { persistentVirtualDisplay?.release() } catch (ignored: Exception) {}
         try { persistentImageReader?.close() } catch (ignored: Exception) {}
         persistentVirtualDisplay = null
         persistentImageReader = null
+        synchronized(frameLock) {
+            latestFrameBitmap?.recycle()
+            latestFrameBitmap = null
+        }
     }
 
     private fun startForegroundServiceNotification() {
@@ -324,6 +380,7 @@ class OverlayService : Service() {
 
         try {
             windowManager.addView(floatingButton, btnParams)
+            isButtonAdded = true
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException while adding view: ${e.message}")
             Toast.makeText(this, "⚠️ ไม่สามารถแสดงปุ่มลอยได้ ตรวจสอบสิทธิ์ Overlay", Toast.LENGTH_LONG).show()
@@ -335,6 +392,7 @@ class OverlayService : Service() {
 
     private fun startLoadingAnimation() {
         isTranslating = true
+        (floatingButton.tag as? ObjectAnimator)?.cancel()
         floatingButton.text = "⏳"
         val rotateAnimator = ObjectAnimator.ofFloat(floatingButton, "rotation", 0f, 360f).apply {
             duration = 800
@@ -382,70 +440,34 @@ class OverlayService : Service() {
 
         ensureCaptureSizeMatchesScreen()
 
-        // รอเฟรมแรกสักครู่ แล้วค่อยไปอ่านภาพบน background thread (กัน UI ค้าง)
-        handler.postDelayed({
-            Thread { doCaptureAndProcess() }.start()
-        }, 180)
+        Thread { doCaptureAndProcess() }.start()
     }
 
     private fun doCaptureAndProcess() {
-        val imageReader = persistentImageReader
-        if (imageReader == null) {
-            handler.post { resetLoadingAnimation() }
-            return
+        var bitmap: Bitmap? = null
+        var waited = 0
+        // ปกติเฟรมจะพร้อมอยู่แล้วจาก listener ที่ทำงานตลอดเวลา รอสั้นๆ เผื่อ session เพิ่งเปิด
+        while (waited < 1000) {
+            synchronized(frameLock) {
+                latestFrameBitmap?.let { bitmap = it.copy(it.config, false) }
+            }
+            if (bitmap != null) break
+            SystemClock.sleep(50)
+            waited += 50
         }
 
-        var image: android.media.Image? = null
-
-        try {
-            for (i in 1..5) {
-                try {
-                    image = imageReader.acquireLatestImage() ?: imageReader.acquireNextImage()
-                    if (image != null) break
-                } catch (e: Exception) {
-                    Log.w(TAG, "Acquire attempt $i failed: ${e.message}")
-                }
-                SystemClock.sleep(80)
-            }
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException: ${e.message}", e)
+        if (bitmap == null) {
             handler.post {
                 resetLoadingAnimation()
-                Toast.makeText(this, "❌ mediaProjection SecurityException: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-            return
-        } catch (e: Exception) {
-            Log.e(TAG, "Error acquiring image: ${e.message}", e)
-        }
-
-        if (image == null) {
-            handler.post {
-                resetLoadingAnimation()
-                Toast.makeText(this, "⚠️ ไม่สามารถแคปภาพได้ ลองกดแปลอีกครั้ง", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "⚠️ ยังไม่มีภาพหน้าจอ ลองแตะปุ่มแปลอีกครั้ง", Toast.LENGTH_SHORT).show()
             }
             return
         }
 
         var base64Image = ""
         try {
-            val planes = image.planes
-            if (planes.isEmpty()) {
-                image.close()
-                handler.post { resetLoadingAnimation() }
-                return
-            }
-
-            val buffer = planes[0].buffer
-            val pixelStride = planes[0].pixelStride
-            val rowStride = planes[0].rowStride
-            val rowPadding = rowStride - pixelStride * image.width
-
-            val fullBitmap = Bitmap.createBitmap(image.width + rowPadding / pixelStride, image.height, Bitmap.Config.ARGB_8888)
-            fullBitmap.copyPixelsFromBuffer(buffer)
-            val croppedBitmap = Bitmap.createBitmap(fullBitmap, 0, 0, image.width, image.height)
-
             val byteArrayOutputStream = ByteArrayOutputStream()
-            croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 60, byteArrayOutputStream)
+            bitmap!!.compress(Bitmap.CompressFormat.JPEG, 60, byteArrayOutputStream)
             base64Image = Base64.encodeToString(byteArrayOutputStream.toByteArray(), Base64.NO_WRAP)
         } catch (e: Exception) {
             Log.e(TAG, "Error processing image: ${e.message}", e)
@@ -455,7 +477,7 @@ class OverlayService : Service() {
             }
             return
         } finally {
-            try { image.close() } catch (ignored: Exception) {}
+            bitmap?.recycle()
         }
 
         val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
